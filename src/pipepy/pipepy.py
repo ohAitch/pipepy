@@ -1,5 +1,6 @@
 import inspect
 import io
+import os
 import pathlib
 import reprlib
 import types
@@ -17,6 +18,31 @@ ALWAYS_STREAM = False
 INTERACTIVE = False
 
 _JOBS: "dict[int, PipePy]" = {}
+
+
+class _ProcessSubstitution(str):
+    """A /dev/fd/<n> path backed by an active subprocess."""
+
+    def __new__(cls, read_fd: int, producer: "PipePy"):
+        obj = super().__new__(cls, f"/dev/fd/{read_fd}")
+        obj.read_fd = read_fd
+        obj.producer = producer
+        return obj
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            os.close(self.read_fd)
+        except OSError:
+            pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def jobs() -> "list[PipePy]":
@@ -139,6 +165,102 @@ class PipePy:
         self._returncode: Optional[int] = None
         self._stdout = None
         self._stderr = None
+
+    @property
+    def _psub(self):
+        """Return a process-substitution path backed by a live producer."""
+        if os.name == "nt":
+            raise OSError("Process substitution is not supported on Windows")
+
+        read_fd, write_fd = os.pipe()
+        producer = copy(self)
+        producer._lazy = True
+        producer._process = None
+        producer._returncode = None
+        producer._stdout = None
+        producer._stderr = None
+        producer._input_consumed = False
+
+        stdin: Optional[Union[IO[Any], int]]
+        if isinstance(producer._input, PipePy):
+            if producer._input._returncode is not None:
+                stdin = PIPE
+            else:
+                producer._input._start_background_job()
+                assert producer._input._process is not None
+                stdin = producer._input._process.stdout
+        elif isinstance(producer._input, (Iterable, File)):
+            stdin = PIPE
+        else:
+            stdin = None
+
+        if producer._stream_stderr is None and producer._stream is None:
+            stderr = None if ALWAYS_STREAM else PIPE
+        elif producer._stream_stderr is None and producer._stream is not None:
+            stderr = None if producer._stream else PIPE
+        else:
+            stderr = None if producer._stream_stderr else PIPE
+
+        producer._process = Popen(
+            producer._args,
+            stdin=stdin,
+            stdout=write_fd,
+            stderr=stderr,
+            text=producer._text,
+        )
+        os.close(write_fd)
+
+        if isinstance(producer._input, PipePy):
+            if producer._input._returncode is not None:
+                chunk = producer._input.stdout
+                if producer._text:
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode(producer._encoding)
+                else:
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode(producer._encoding)
+                assert producer._process is not None
+                assert producer._process.stdin is not None
+                producer._process.stdin.write(chunk)
+                producer._process.stdin.flush()
+                producer._process.stdin.close()
+            else:
+                producer._input._start_background_job()
+                producer._input._feed_input()
+        elif isinstance(producer._input, File):
+            with open(
+                producer._input.filename,
+                mode="r" if producer._text else "rb",
+                encoding=producer._encoding if producer._text else None,
+            ) as file_obj:
+                assert producer._process is not None
+                assert producer._process.stdin is not None
+                for line in file_obj:
+                    producer._process.stdin.write(line)
+                    producer._process.stdin.flush()
+                producer._process.stdin.close()
+        elif isinstance(producer._input, Iterable):
+            if isinstance(producer._input, (str, bytes)):
+                producer._input = [producer._input]
+            assert producer._process is not None
+            assert producer._process.stdin is not None
+            for chunk in producer._input:
+                if producer._text:
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode(producer._encoding)
+                else:
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode(producer._encoding)
+                producer._process.stdin.write(chunk)
+                producer._process.stdin.flush()
+            producer._process.stdin.close()
+
+        producer._input_consumed = True
+        return _ProcessSubstitution(read_fd, producer)
+
+    @property
+    def psub(self):
+        return self._psub
 
     def __call__(
         self,
@@ -296,6 +418,9 @@ class PipePy:
 
         final_args: list[str] = []
         for arg in args:
+            if isinstance(arg, _ProcessSubstitution):
+                final_args.append(str(arg))
+                continue
             arg = str(arg)
             if globbed := glob(arg, recursive=True):
                 final_args.extend(globbed)
@@ -819,16 +944,16 @@ class PipePy:
            object is a function, then the command will be evaluated and its
            output will be passed as arguments to the function:
 
-           - If the function's arguments are a subset of [returncode,
-             output, errors], the command will be waited and its output
-             will be passed at once to the function
-           - If the function's arguments are a subset of [stdout, stderr],
-             the command will be run in the background and its stdout and
-             stderr streams will be made available to the function
+            - If the function's arguments are a subset of [returncode,
+              output, errors], the command will be waited and its output
+              will be passed at once to the function
+            - If the function's arguments are a subset of [stdout, stderr],
+              the command will be run in the background and its stdout and
+              stderr streams will be made available to the function
 
-           The ordering of the arguments doesn't matter since the
-           function's signature will be inspected to determine the
-           appropriate behavior
+            The ordering of the arguments doesn't matter since the
+            function's signature will be inspected to determine the
+            appropriate behavior
 
         4. If only the the left operand is a PipePy object and the right
            object is a generator (the return value of a function that
